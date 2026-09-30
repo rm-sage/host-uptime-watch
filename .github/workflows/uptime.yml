@@ -36,7 +36,7 @@ jobs:
     timeout-minutes: 8
     steps:
       - name: Restore last state
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: state
           key: uptime-state-${{ github.run_id }}
@@ -123,7 +123,7 @@ jobs:
 
       - name: Save state
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: state
           key: uptime-state-${{ github.run_id }}
