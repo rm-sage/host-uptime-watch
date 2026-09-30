@@ -1,0 +1,149 @@
+name: Host uptime watch
+
+# External check of the addon host. Beszel, the container sweep and the pre-check
+# all run ON that host, so none of them can report the host itself going down.
+# This runs on GitHub's runners instead and pushes to ntfy (secret NTFY_URL).
+#
+# Alerts: one high-priority push when the set of failing endpoints changes, a
+# reminder every 2h while it stays down, one push on recovery. The job also
+# FAILS while anything is down, so GitHub's own failure email is a second path.
+
+on:
+  schedule:
+    # Every 30 min, not 15: this repo is private, a run bills at least one
+    # minute, and */15 is ~2,900 min/month -- more than the Free plan's 2,000,
+    # which would stop ALL private Actions (incl. both upstream-sync-watches)
+    # late each month. Switch to */15 only if the account has the minutes.
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: Also send a test push to ntfy
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write   # keepalive below re-enables this workflow's schedule
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Restore last state
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: uptime-state-${{ github.run_id }}
+          restore-keys: uptime-state-
+
+      - name: Probe endpoints
+        id: probe
+        shell: bash
+        run: |
+          set -uo pipefail
+          # name|url -- each must answer HTTP 200
+          checks=(
+            "AIOStreams|https://aiostreams.animasec.dev/api/v1/status"
+            "AIOMetadata|https://aiometadata.animasec.dev/health/ready"
+            "Aura cloud|https://aura.animasec.dev/healthz"
+            "Beszel hub|https://monitor.animasec.dev/api/health"
+          )
+          failing=(); details=()
+          for c in "${checks[@]}"; do
+            name="${c%%|*}"; url="${c#*|}"; code=000
+            for attempt in 1 2 3; do
+              code="$(curl -s -o /dev/null -m 15 -w '%{http_code}' "$url" || true)"
+              [ "$code" = 200 ] && break
+              [ "$attempt" -lt 3 ] && sleep 20
+            done
+            echo "$name: HTTP $code ($url)"
+            if [ "$code" != 200 ]; then
+              failing+=("$name")
+              details+=("$name: HTTP $code after 3 tries - $url")
+            fi
+          done
+          {
+            echo "failing=$(IFS=,; echo "${failing[*]:-}")"
+            echo 'details<<EOF'
+            printf '%s\n' "${details[@]:-}"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Decide and alert
+        shell: bash
+        env:
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          FAILING: ${{ steps.probe.outputs.failing }}
+          DETAILS: ${{ steps.probe.outputs.details }}
+          TEST_ALERT: ${{ github.event_name == 'workflow_dispatch' && inputs.test_alert }}
+        run: |
+          set -uo pipefail
+          if [ -z "${NTFY_URL:-}" ]; then
+            echo "::error::secret NTFY_URL is not set"; exit 1
+          fi
+          push() { # title priority tags body
+            curl -fsS -m 20 -H "Title: $1" -H "Priority: $2" -H "Tags: $3" \
+              --data-binary "$4" "$NTFY_URL" >/dev/null && echo "pushed: $1" \
+              || echo "::warning::ntfy push failed: $1"
+          }
+          mkdir -p state
+          prev=""; last_alert=0
+          [ -f state/failing ] && prev="$(cat state/failing)"
+          [ -f state/last_alert ] && last_alert="$(cat state/last_alert)"
+          now="$(date +%s)"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          if [ "$TEST_ALERT" = true ]; then
+            push "Host uptime watch: test" default "test_tube" \
+              "Test push from GitHub Actions. Current failing endpoints: ${FAILING:-none}. $run_url"
+          fi
+
+          if [ -n "$FAILING" ]; then
+            if [ "$FAILING" != "$prev" ] || [ $((now - last_alert)) -ge 7200 ]; then
+              push "Addon host DOWN: $FAILING" high "rotating_light" \
+                "External check (GitHub Actions) cannot reach:
+          $DETAILS
+          If everything is failing, the host itself (or Traefik) is down.
+          $run_url"
+              last_alert="$now"
+            fi
+          elif [ -n "$prev" ]; then
+            push "Addon host recovered" default "white_check_mark" \
+              "All endpoints answer 200 again (were failing: $prev). $run_url"
+            last_alert=0
+          fi
+          printf '%s' "$FAILING" > state/failing
+          printf '%s' "$last_alert" > state/last_alert
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: uptime-state-${{ github.run_id }}
+
+      - name: Keep the schedule alive
+        # GitHub disables schedules in repos with no activity for 60 days.
+        if: github.event_name == 'schedule'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(date -u +%d%H)" = "0100" ]; then
+            gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/uptime.yml/enable" \
+              && echo "schedule re-enabled (keepalive)"
+          fi
+
+      - name: Fail while anything is down
+        if: steps.probe.outputs.failing != ''
+        env:
+          FAILING: ${{ steps.probe.outputs.failing }}
+        run: |
+          echo "::error::down: $FAILING"
+          exit 1
