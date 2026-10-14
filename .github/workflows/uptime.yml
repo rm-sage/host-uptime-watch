@@ -10,11 +10,11 @@ name: Host uptime watch
 
 on:
   schedule:
-    # Every 30 min, not 15: this repo is private, a run bills at least one
-    # minute, and */15 is ~2,900 min/month -- more than the Free plan's 2,000,
-    # which would stop ALL private Actions (incl. both upstream-sync-watches)
-    # late each month. Switch to */15 only if the account has the minutes.
-    - cron: '*/30 * * * *'
+    # Every 15 min. Keep this repo PUBLIC: public repos run Actions for free.
+    # As a private repo, */15 is ~2,900 billed min/month, more than the Free
+    # plan's 2,000, and exhausting that stops ALL private Actions (incl. both
+    # upstream-sync-watches). Drop to */30 if it ever has to go private again.
+    - cron: '*/15 * * * *'
   workflow_dispatch:
     inputs:
       test_alert:
